@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>NEXUS v23 - ULTIMATE</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r134/three.min.js"></script>
+    <style>
+        :root { --c:#0ff; --g:#0f8; --a:#fc0; --bg:#000; }
+        body { margin:0; overflow:hidden; background:#000; color:var(--c); font-family: "Hiragino Sans", "Meiryo", monospace; touch-action:none; }
+        
+        /* 背面の走査線とグリッド演出 */
+        #ar-canvas { position:fixed; inset:0; z-index:10; }
+        #vfx-layer { position:fixed; inset:0; z-index:25; pointer-events:none; 
+            background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 255, 255, 0.05) 50%), 
+                        linear-gradient(90deg, rgba(255, 0, 0, 0.03), rgba(0, 255, 0, 0.01), rgba(0, 0, 255, 0.03));
+            background-size: 100% 4px, 3px 100%; }
+
+        /* 演算マトリクス（背面を流れるログ） */
+        #calc-matrix {
+            position: fixed; inset: 0; z-index: 15;
+            font-size: 9px; color: rgba(0, 255, 128, 0.18);
+            pointer-events: none; overflow: hidden;
+            line-height: 1.1; white-space: nowrap; font-family: monospace; padding: 10px;
+        }
+        .matrix-line { animation: slideUp 1.2s linear forwards; opacity: 0.8; }
+        @keyframes slideUp { from { transform: translateY(100vh); } to { transform: translateY(-10vh); } }
+
+        /* 起動画面 */
+        #boot-overlay { 
+            position:fixed; inset:0; z-index:100; 
+            background:rgba(0,10,20,0.98); padding:30px; 
+            display:flex; flex-direction:column; align-items:center; justify-content:center; 
+        }
+        #console { width:100%; flex:1; overflow:auto; font-size:11px; margin-bottom:25px; border:1px solid rgba(0,255,255,0.2); padding:15px; background:rgba(0,0,0,0.6); box-shadow: inset 0 0 20px rgba(0,255,255,0.1); }
+        .log { margin-bottom:5px; border-left: 2px solid var(--c); padding-left: 10px; animation: fadeIn 0.3s; }
+        .log.ok { color:var(--g); border-left-color:var(--g); }
+        @keyframes fadeIn { from { opacity:0; transform:translateX(-10px); } to { opacity:1; transform:translateX(0); } }
+
+        #start-btn { 
+            width:90%; padding:25px; background:rgba(0,255,128,0.1); border:2px solid var(--g); 
+            color:var(--g); font-size:20px; font-weight:bold; cursor:pointer; letter-spacing:6px;
+            box-shadow: 0 0 15px rgba(0,255,128,0.2); transition: all 0.2s;
+        }
+        #start-btn:active { transform: scale(0.95); background:rgba(0,255,128,0.3); }
+
+        /* 強化HUD演出 */
+        #calib-hud { position:fixed; inset:0; z-index:50; display:none; flex-direction:column; align-items:center; justify-content:center; pointer-events:none; }
+        .reticle-container { position:relative; width:240px; height:240px; margin-bottom:40px; }
+        .zenith-reticle { 
+            position:absolute; inset:0; border:1px dashed rgba(0,255,255,0.3); border-radius:50%; 
+            transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+        }
+        .zenith-reticle.active { border:2px solid var(--g); transform:scale(1.15); box-shadow: 0 0 50px rgba(0,255,128,0.5); }
+
+        #guide-dot {
+            position:absolute; width:20px; height:20px; background:var(--a); border-radius:50%;
+            left:50%; top:50%; margin:-10px 0 0 -10px;
+            box-shadow: 0 0 20px var(--a); will-change: transform;
+        }
+
+        #status-display { text-align:center; min-height:100px; }
+        #main-msg { font-size:28px; color:var(--a); font-weight:bold; margin-bottom:10px; text-shadow:0 0 15px rgba(255,204,0,0.6); letter-spacing:2px; }
+        #sub-msg { font-size:13px; color:var(--c); opacity:0.8; letter-spacing:1px; text-transform: uppercase; }
+        
+        .progress-box { width:280px; height:4px; background:rgba(0,255,255,0.1); margin-top:30px; border:1px solid rgba(0,255,255,0.2); overflow:hidden; }
+        #bar { height:100%; background:var(--g); width:0%; transition: width 0.1s; box-shadow:0 0 15px var(--g); }
+    </style>
+</head>
+<body>
+
+<canvas id="ar-canvas"></canvas>
+<div id="vfx-layer"></div>
+<div id="calc-matrix"></div>
+
+<div id="boot-overlay">
+    <div style="font-size:24px; letter-spacing:12px; margin-bottom:25px; font-weight:bold; color:var(--c); text-shadow: 0 0 10px var(--c);">NEXUS v23</div>
+    <div id="console"></div>
+    <button id="start-btn">INITIALIZE SYSTEM</button>
+</div>
+
+<div id="calib-hud">
+    <div class="reticle-container">
+        <div id="reticle" class="zenith-reticle"></div>
+        <div id="guide-dot"></div>
+    </div>
+    <div id="status-display">
+        <div id="main-msg">STANDBY</div>
+        <div id="sub-msg">Awaiting Zenith Alignment</div>
+    </div>
+    <div class="progress-box"><div id="bar"></div></div>
+</div>
+
+<script>
+/**
+ * --- NEXUS CORE ENGINE (補正ロジック完全統合) ---
+ */
+const Core = {
+    bias: { x: 0, y: 0 },
+    last: { b: null, g: null },
+    trueHeading: 0,
+    currentPos: { x: 0, y: 0 },
+    
+    // 1. 輝度サンプリング
+    getLumi: (data) => {
+        let v = [];
+        for(let i=0; i<data.length; i+=4) {
+            let b = (data[i]+data[i+1]+data[i+2])/3;
+            if(b < 252) v.push(b);
+        }
+        if(!v.length) return 0;
+        v.sort((a,b)=>a-b);
+        return v[Math.floor(v.length/2)];
+    },
+
+    // 2. ドリフト補正
+    applyDrift: (b, g) => {
+        if(Core.last.b === null) { Core.last = {b,g}; return {b,g}; }
+        const dB = b - Core.last.b, dG = g - Core.last.g;
+        if(Math.abs(dB) < 0.04) Core.bias.y += dB * 0.02;
+        if(Math.abs(dG) < 0.04) Core.bias.x += dG * 0.02;
+        Core.last = {b,g};
+        return { b: b - Core.bias.y, g: g - Core.bias.x };
+    },
+
+    // 3. 地磁気フュージョン
+    fuseHeading: (mag, k=0.95) => {
+        let diff = mag - Core.trueHeading;
+        if(diff > 180) diff -= 360; if(diff < -180) diff += 360;
+        Core.trueHeading += diff * (1 - k);
+        return Core.trueHeading;
+    },
+
+    // 4. スムージング
+    smooth: (cur, tar, f=0.15) => cur + (tar - cur) * f
+};
+
+/**
+ * --- UI & SYSTEM SEQUENCE ---
+ */
+let scene, camera, renderer, stars, zenithOK = false, isCalib = false, hasVib = false, magHead = 0;
+const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+
+function log(t, c="") {
+    const d = document.createElement("div"); d.className = "log "+c; d.textContent = ">> "+t;
+    const con = document.getElementById("console"); con.appendChild(d); con.scrollTop = con.scrollHeight;
+}
+
+function playPing() {
+    try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const o = ctx.createOscillator(); const g = ctx.createGain();
+        o.type = 'sine'; o.frequency.setValueAtTime(880, ctx.currentTime);
+        o.frequency.exponentialRampToValueAtTime(1760, ctx.currentTime + 0.1);
+        g.gain.setValueAtTime(0.1, ctx.currentTime); g.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.1);
+        o.connect(g); g.connect(ctx.destination); o.start(); o.stop(ctx.currentTime + 0.1);
+    } catch(e){}
+}
+
+function initAR() {
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+    renderer = new THREE.WebGLRenderer({canvas:document.getElementById('ar-canvas'), alpha:true, antialias:true});
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    const geo = new THREE.BufferGeometry(); const pos = [];
+    for(let i=0; i<3000; i++) pos.push((Math.random()-0.5)*250, (Math.random()-0.5)*250, (Math.random()-0.5)*250);
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    stars = new THREE.Points(geo, new THREE.PointsMaterial({color:0xffffff, size:0.3, opacity:0, transparent:true}));
+    scene.add(stars);
+    animate();
+}
+
+function animate() {
+    requestAnimationFrame(animate);
+    const dot = document.getElementById("guide-dot");
+    if(dot) {
+        const dist = Math.sqrt(Core.currentPos.x**2 + Core.currentPos.y**2);
+        dot.style.transform = `translate(${Core.currentPos.x}px, ${Core.currentPos.y}px) scale(${Math.max(0.5, 1.5 - dist/100)})`;
+        dot.style.background = zenithOK ? "var(--g)" : "var(--a)";
+        dot.style.boxShadow = zenithOK ? "0 0 30px var(--g)" : "0 0 15px var(--a)";
+    }
+    renderer.render(scene, camera);
+}
+
+window.addEventListener('deviceorientationabsolute', (e) => {
+    magHead = e.webkitCompassHeading || (360 - e.alpha);
+}, true);
+
+function onOrientation(e) {
+    if(e.alpha === null) return;
+    const comp = Core.applyDrift(e.beta, e.gamma);
+    const head = Core.fuseHeading(magHead);
+    
+    // 補正済み値でカメラ回転
+    camera.rotation.set(THREE.MathUtils.degToRad(comp.b), THREE.MathUtils.degToRad(360 - head), THREE.MathUtils.degToRad(-comp.g), 'YXZ');
+
+    // ターゲット座標更新 (Lerpで吸い付く動き)
+    const tx = Math.max(-110, Math.min(110, comp.g * 1.6));
+    const ty = Math.max(-110, Math.min(110, (comp.b + 90) * 1.6));
+    Core.currentPos.x = Core.smooth(Core.currentPos.x, tx);
+    Core.currentPos.y = Core.smooth(Core.currentPos.y, ty);
+
+    zenithOK = (Math.abs(comp.b + 90) < 30 && Math.abs(comp.g) < 30);
+    
+    if(!isCalib) {
+        const ret = document.getElementById("reticle"), main = document.getElementById("main-msg"), sub = document.getElementById("sub-msg");
+        if(zenithOK) {
+            if(!hasVib) { playPing(); if(!isIOS && navigator.vibrate) navigator.vibrate(60); hasVib = true; }
+            ret.classList.add("active"); main.textContent = "LOCKED"; main.style.color = "var(--g)";
+            sub.textContent = `SYSTEM SYNC: ${Math.round(head)}° / BIAS READY`;
+        } else {
+            hasVib = false; ret.classList.remove("active");
+            main.textContent = "SCANNING"; main.style.color = "var(--a)";
+            sub.textContent = "Align Device to Zenith";
+        }
+    }
+}
+
+document.getElementById('start-btn').addEventListener('click', async () => {
+    log("コア・エンジン初期化中...", "ok");
+    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+        const res = await DeviceOrientationEvent.requestPermission();
+        if (res === 'granted') window.addEventListener("deviceorientation", onOrientation, true);
+    } else { window.addEventListener("deviceorientation", onOrientation, true); }
+
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({video: {facingMode: "environment"}});
+        log("光学デバイス：オンライン", "ok");
+        log("センサーフュージョン：結合完了", "ok");
+        startCalibration(stream);
+    } catch (e) { log("カメラエラー: " + e.message, "warn"); }
+});
+
+function startCalibration(stream) {
+    document.getElementById("boot-overlay").style.display = "none";
+    document.getElementById("calib-hud").style.display = "flex";
+    const v = document.createElement("video"); v.srcObject = stream; v.play();
+    const c = document.createElement("canvas"); const ctx = c.getContext("2d");
+    const matrix = document.getElementById("calc-matrix");
+    let samples = [];
+
+    const loop = setInterval(() => {
+        if(!zenithOK) return;
+        isCalib = true;
+        document.getElementById("main-msg").textContent = "ANALYZING";
+        document.getElementById("sub-msg").textContent = "Extracting Environmental Light Data...";
+        
+        c.width = 40; c.height = 40; ctx.drawImage(v, 0, 0, 40, 40);
+        const lumi = Core.getLumi(ctx.getImageData(0,0,40,40).data);
+        samples.push(lumi);
+        document.getElementById("bar").style.width = samples.length + "%";
+
+        // マトリクス演出：補正値と生データを垂れ流す
+        const line = document.createElement("div"); line.className = "matrix-line";
+        line.textContent = `B:[${Core.bias.x.toFixed(2)},${Core.bias.y.toFixed(2)}] H:${Math.round(Core.trueHeading)}° LUM:${lumi.toFixed(1)} >> SYNCING...`;
+        matrix.appendChild(line);
+        if(matrix.childNodes.length > 40) matrix.removeChild(matrix.firstChild);
+
+        if(samples.length >= 100) {
+            clearInterval(loop);
+            const avg = samples.reduce((a,b)=>a+b)/samples.length;
+            finalize(avg);
+        }
+    }, 45);
+}
+
+function finalize(lumi) {
+    document.getElementById("main-msg").textContent = "COMPLETE";
+    document.getElementById("main-msg").style.color = "var(--c)";
+    document.getElementById("sub-msg").textContent = "All Systems Nominal. AR Space Optimized.";
+    
+    let op = 0; const targetAlpha = Math.max(0.3, 1 - (lumi/180));
+    const reveal = setInterval(() => {
+        op += 0.05; stars.material.opacity = op * targetAlpha;
+        if(op >= 1) { 
+            clearInterval(reveal); 
+            setTimeout(() => { document.getElementById("calib-hud").style.opacity = "0"; }, 1000);
+        }
+    }, 50);
+}
+
+window.onload = () => { initAR(); log("NEXUS v23 SYSTEM STANDBY."); };
+</script>
+</body>
+</html>
