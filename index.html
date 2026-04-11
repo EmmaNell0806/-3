@@ -173,6 +173,7 @@
         <div style="display:flex; gap:8px; margin-bottom:15px; border-bottom:1px solid var(--astn-dim); padding-bottom:10px;">
             <button onclick="ASTN.openModeSelect()">MODE</button>
             <button id="btn-stack" onclick="ASTN.toggleStacking()" style="font-weight:600;">START STACK</button>
+            <button onclick="ASTN.startDarkCal()" title="レンズを覆ってからタップ">DARK CAL</button>
             <button onclick="ASTN.screenOff()">&#127769;</button>
         </div>
         <div id="panel-astro">
@@ -199,13 +200,26 @@
                 mode: 'astro',
                 isStacking: false,
                 stackTime: 0,
-                // Sensor state — updated by real or simulated sensor
                 accel: { x: 0, y: 0, z: 9.8 },
                 orient: { alpha: 0, beta: 0, gamma: 0 },
-                shakeBuffer: [],   // rolling window (20 samples = 10s)
-                lastShake: 0,      // rolling average of net-g
+                shakeBuffer: [],
+                lastShake: 0,
                 sensorSource: 'INIT',
                 debugOpen: false,
+                // ── Dark calibration ──
+                dark: {
+                    lum: parseFloat(localStorage.getItem('astn_dark_lum')) || null,
+                    sigma: parseFloat(localStorage.getItem('astn_dark_sigma')) || 0,
+                    frames: [],
+                    calibrating: false,
+                    countdown: 0,
+                },
+                // ── AGC learning ──
+                agc: {
+                    history: [],   // 直近10フレームの生輝度
+                    offset: 0,     // 累積AGCオフセット（log空間）
+                    sqmPrev: null,
+                },
             },
 
             // ── Boot ──────────────────────────────────────────────────────
@@ -233,7 +247,73 @@
                 this.startEngines();
             },
 
-            // ── Camera Brightness Sampler ────────────────────────────────
+            // ── Dark Calibration ─────────────────────────────────────────
+            startDarkCal: function() {
+                const dc = this.state.dark;
+                dc.frames = []; dc.calibrating = true; dc.countdown = 3;
+                const el = document.getElementById('sqm-display');
+                el.textContent = 'DARK CAL: レンズを覆って静止 [3]';
+                const tick = setInterval(() => {
+                    dc.countdown--;
+                    const lum = this.sampleBrightness();
+                    if (lum !== null) dc.frames.push(lum);
+                    if (dc.countdown <= 0) {
+                        clearInterval(tick);
+                        if (dc.frames.length >= 3) {
+                            const mean  = dc.frames.reduce((s,v)=>s+v,0) / dc.frames.length;
+                            const sigma = Math.sqrt(dc.frames.reduce((s,v)=>s+(v-mean)**2,0) / dc.frames.length);
+                            dc.lum = mean; dc.sigma = sigma; dc.calibrating = false;
+                            localStorage.setItem('astn_dark_lum',   mean.toFixed(2));
+                            localStorage.setItem('astn_dark_sigma', sigma.toFixed(2));
+                            el.textContent = `DARK CAL OK  base=${mean.toFixed(1)} σ=${sigma.toFixed(1)}`;
+                        } else {
+                            dc.calibrating = false;
+                            el.textContent = 'DARK CAL FAIL: カメラ未準備';
+                        }
+                    } else {
+                        el.textContent = `DARK CAL: レンズを覆って静止 [${dc.countdown}]`;
+                    }
+                }, 1000);
+            },
+
+            // ── Logarithmic SQM with dark correction + AGC learning ──────
+            computeSQM: function(rawLum, stab) {
+                const dc  = this.state.dark;
+                const agc = this.state.agc;
+
+                // 1. ダーク補正
+                const darkLevel = dc.lum !== null ? dc.lum : 0;
+                const range     = Math.max(1, 255 - darkLevel);
+                const corrected = Math.max(0, rawLum - darkLevel);
+
+                // 2. 正規化 → ガンマ線形化（γ=2.2）
+                const norm     = corrected / range;
+                const L_linear = Math.pow(Math.max(norm, 1e-7), 2.2);
+
+                // 3. Pogson等級式 → SQM
+                const sqmRaw = -2.5 * Math.log10(L_linear) + 16.5;
+
+                // 4. AGC学習補正
+                agc.history.push(sqmRaw);
+                if (agc.history.length > 10) agc.history.shift();
+
+                if (agc.sqmPrev !== null && this.state.lastShake < 0.03) {
+                    const delta = sqmRaw - agc.sqmPrev;
+                    // 揺れなし＋0.4mag以上の急変 → AGC調整と判定
+                    if (Math.abs(delta) > 0.4) {
+                        agc.offset -= delta * 0.6; // 逆補正（減衰係数0.6）
+                    }
+                }
+                // オフセットを徐々に0へ戻す（場面が変わったとき対応）
+                agc.offset *= 0.995;
+                agc.sqmPrev = sqmRaw;
+
+                const sqmFinal = sqmRaw + agc.offset + (stab / 100) * 0.3
+                               + (Math.random() - 0.5) * 0.04;
+                return Math.max(13.5, Math.min(22.5, sqmFinal));
+            },
+
+            // ── Camera Brightness Sampler ─────────────────────────────────
             sampleBrightness: function() {
                 if (!this._lumCtx || !this._lumVid || this._lumVid.readyState < 2) return null;
                 try {
@@ -311,25 +391,19 @@
                     // Sensitivity: 0.05g avg → ~75% stability
                     const stab = Math.max(0, Math.min(100, 100 - (this.state.lastShake * 800)));
 
-                    // SQM: カメラ輝度から算出（暗い→高SQM、明るい→低SQM）
-                    const lum = this.sampleBrightness();
-                    let sqm;
-                    if (lum !== null) {
-                        // lum 0〜255 → SQM 22.0〜13.5（線形マッピング + 安定補正）
-                        const sqmFromLight = 22.0 - (lum / 255) * 8.5;
-                        const stabBonus   = (stab / 100) * 0.4;
-                        const jitter      = (Math.random() - 0.5) * 0.04;
-                        sqm = Math.max(13.5, Math.min(22.0, sqmFromLight + stabBonus + jitter));
-                        document.getElementById('dbg-lum').textContent = lum.toFixed(1);
-                    } else {
-                        // カメラ未初期化時のフォールバック
-                        sqm = 19.2 + (stab / 100) * 1.3 - this.state.lastShake * 4
-                              + (Math.random() - 0.5) * 0.08;
-                        sqm = Math.max(13.5, Math.min(22.0, sqm));
-                        document.getElementById('dbg-lum').textContent = 'N/A';
+                    // SQM: ダーク補正 + AGC学習 + Pogson対数スケール
+                    if (!this.state.dark.calibrating) {
+                        const lum = this.sampleBrightness();
+                        if (lum !== null) {
+                            const sqm = this.computeSQM(lum, stab);
+                            document.getElementById('sqm-display').textContent =
+                                `SQM: ${sqm.toFixed(2)} mag/arcsec\u00B2`;
+                            document.getElementById('dbg-lum').textContent =
+                                `${lum.toFixed(1)} (dk:${this.state.dark.lum !== null ? this.state.dark.lum.toFixed(0) : '?'})`;
+                        } else {
+                            document.getElementById('dbg-lum').textContent = 'N/A';
+                        }
                     }
-                    document.getElementById('sqm-display').textContent =
-                        `SQM: ${sqm.toFixed(2)} mag/arcsec\u00B2`;
 
                     // Update sensor debug panel
                     const s = this.state;
